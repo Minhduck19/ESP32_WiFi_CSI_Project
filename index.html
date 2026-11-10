@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WiFi CSI Activity Recognition Dashboard</title>
+    <!-- Tailwind CSS để tạo giao diện đẹp mắt -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js để vẽ biểu đồ -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- MQTT.js để kết nối WebSocket tới Mosquitto Broker -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+</head>
+<body class="bg-slate-100 font-sans antialiased">
+
+    <!-- Header -->
+    <header class="bg-indigo-600 text-white shadow-md py-4 px-6 mb-6">
+        <div class="container mx-auto flex justify-between items-center">
+            <h1 class="text-xl font-bold">🏠 Hệ thống Nhận diện Hoạt động WiFi CSI (3 TX + 1 RX)</h1>
+            <span id="connection-status" class="bg-red-500 text-xs px-3 py-1 rounded-full font-semibold">Đang ngắt kết nối</span>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="container mx-auto px-6 grid grid-cols-1 md:grid-cols-3 gap-6">
+        
+        <!-- Cột trái: Trạng thái hiện tại -->
+        <div class="bg-white p-6 rounded-xl shadow-md flex flex-col justify-between">
+            <div>
+                <h2 class="text-gray-500 text-sm font-semibold uppercase tracking-wider mb-2">Trạng thái hiện tại</h2>
+                <div id="state-label" class="text-3xl font-extrabold text-indigo-600 mb-4">Chờ dữ liệu...</div>
+            </div>
+            <div class="border-t pt-4">
+                <div class="flex justify-between items-center mb-2">
+                    <span class="text-gray-600 text-sm">Độ tin cậy (Confidence):</span>
+                    <span id="confidence-val" class="font-bold text-gray-800">0%</span>
+                </div>
+                <!-- Thanh tiến trình độ tin cậy -->
+                <div class="w-full bg-gray-200 rounded-full h-3">
+                    <div id="confidence-bar" class="bg-indigo-600 h-3 rounded-full transition-all duration-300" style="width: 0%"></div>
+                </div>
+            </div>
+            <div class="mt-6 text-xs text-gray-400">
+                Cập nhật lần cuối: <span id="last-update">--:--:--</span>
+            </div>
+        </div>
+
+        <!-- Cột phải: Biểu đồ trực quan thời gian thực -->
+        <div class="bg-white p-6 rounded-xl shadow-md md:col-span-2">
+            <h2 class="text-gray-500 text-sm font-semibold uppercase tracking-wider mb-4">Biểu đồ biên độ CSI / Lịch sử nhận diện</h2>
+            <div class="relative h-64">
+                <canvas id="realtimeChart"></canvas>
+            </div>
+        </div>
+
+    </main>
+
+    <!-- JavaScript xử lý MQTT và Chart.js -->
+    <script>
+        // 1. Cấu hình biểu đồ Chart.js
+        const ctx = document.getElementById('realtimeChart').getContext('2d');
+        const realtimeChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [], // Thời gian
+                datasets: [{
+                    label: 'Độ tin cậy nhận diện (%)',
+                    data: [],
+                    borderColor: '#4f46e5',
+                    backgroundColor: 'rgba(79, 70, 229, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.3
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        max: 100
+                    }
+                }
+            }
+        });
+
+        // 2. Kết nối MQTT Broker qua WebSocket (Cổng 9001 đã cấu hình ở Ngày 1)
+        // Lưu ý: Đổi 'localhost' thành IP của máy tính nếu mở web trên thiết bị khác
+        const brokerUrl = 'ws://localhost:9001'; 
+        const topic = 'ips/har/state';
+
+        console.log("[*] Đang kết nối tới MQTT Broker qua WebSocket...");
+        const client = mqtt.connect(brokerUrl);
+
+        client.on('connect', () => {
+            console.log("[*] Kết nối MQTT thành công!");
+            document.getElementById('connection-status').textContent = 'Đã kết nối MQTT';
+            document.getElementById('connection-status').className = 'bg-green-500 text-white text-xs px-3 py-1 rounded-full font-semibold';
+            client.subscribe(topic, (err) => {
+                if (!err) {
+                    console.log(`[*] Đã đăng ký nhận tin từ topic: ${topic}`);
+                }
+            });
+        });
+
+        client.on('error', (err) => {
+            console.error("Lỗi kết nối MQTT: ", err);
+            document.getElementById('connection-status').textContent = 'Lỗi kết nối';
+            document.getElementById('connection-status').className = 'bg-red-500 text-white text-xs px-3 py-1 rounded-full font-semibold';
+        });
+
+        // 3. Nhận dữ liệu từ MQTT và cập nhật giao diện
+        client.on('message', (top, payload) => {
+            try {
+                const data = JSON.parse(payload.toString());
+                const label = data.label; // VD: "walking", "static", "empty"
+                const confidence = Math.round(data.confidence * 100);
+                const timeStr = new Date(data.ts).toLocaleTimeString();
+
+                // Cập nhật text giao diện
+                document.getElementById('state-label').textContent = label.toUpperCase();
+                document.getElementById('confidence-val').textContent = confidence + '%';
+                document.getElementById('confidence-bar').style.width = confidence + '%';
+                document.getElementById('last-update').textContent = timeStr;
+
+                // Đổi màu sắc theo trạng thái cho sinh động
+                const labelElement = document.getElementById('state-label');
+                if (label === 'walking') labelElement.className = 'text-3xl font-extrabold text-amber-500 mb-4';
+                else if (label === 'static') labelElement.className = 'text-3xl font-extrabold text-blue-600 mb-4';
+                else labelElement.className = 'text-3xl font-extrabold text-emerald-600 mb-4';
+
+                // Cập nhật dữ liệu vào biểu đồ
+                if (realtimeChart.data.labels.length > 20) {
+                    realtimeChart.data.labels.shift();
+                    realtimeChart.data.datasets[0].data.shift();
+                }
+                realtimeChart.data.labels.push(timeStr);
+                realtimeChart.data.datasets[0].data.push(confidence);
+                realtimeChart.data.datasets[0].label = `Độ tin cậy (${label})`;
+                realtimeChart.update();
+
+            } catch (e) {
+                console.error("Lỗi parse JSON từ payload MQTT: ", e);
+            }
+        });
+    </script>
+</body>
+</html>
