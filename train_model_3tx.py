@@ -1,103 +1,129 @@
+"""Huấn luyện nhận diện hoạt động từ CSI 3 TX, ĐÁNH GIÁ THEO PHIÊN THU CHƯA THẤY.
+
+  python train_model_3tx.py --csv csi_dataset_3tx.csv
+  python train_model_3tx.py --csv csi_dataset_3tx.csv --map standing=still,empty=still,walking=motion
+
+Đánh giá: phiên thứ k của MỖI nhãn được giữ lại làm tập kiểm tra, huấn luyện trên các
+phiên còn lại (leave-one-session-round-out). Không bao giờ chia ngẫu nhiên các cửa sổ.
+File CSV cũ (không có session_id) vẫn dùng được: phiên được tách theo khoảng trống > 5 giây.
+"""
+import argparse
+
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
 
-CSV_FILE = "csi_dataset_3tx.csv"
-MODEL_OUTPUT = "csi_model_3tx.pkl"
-WINDOW_PER_TX = 12  # 12 gói mỗi TX (~0.6 giây ở tần số 20Hz)
-STEP_PER_TX = 5     # Bước trượt 5 gói
+import csi_features as F
 
 
-def hampel_filter_1d(series: np.ndarray, window_size: int = 4, n_sigmas: float = 3.0) -> np.ndarray:
-    filtered = series.copy()
-    k = 1.4826
-    for i in range(window_size, len(series) - window_size):
-        window = series[i - window_size : i + window_size + 1]
-        median = np.median(window)
-        mad = k * np.median(np.abs(window - median))
-        if mad > 0 and np.abs(series[i] - median) > n_sigmas * mad:
-            filtered[i] = median
-    return filtered
+def load(csv_path, gap_sec=5.0):
+    df = pd.read_csv(csv_path).copy()
+    csi_cols = [c for c in df.columns if c.startswith("csi_")]
+    ts = pd.to_datetime(df["timestamp"])
+    df["t"] = (ts - ts.min()).dt.total_seconds()
+    df = df.sort_values("t").reset_index(drop=True)
+    if "session_id" not in df.columns:
+        k = df.groupby("label")["t"].transform(lambda s: (s.diff().fillna(0) > gap_sec).cumsum())
+        df["session_id"] = df["label"] + "#" + k.astype(str)
+        print("[i] File không có session_id: tách phiên theo khoảng trống thời gian.")
+    starts = df.groupby(["label", "session_id"])["t"].min().reset_index()
+    starts["fold"] = starts.groupby("label")["t"].rank(method="first").astype(int) - 1
+    df = df.merge(starts[["label", "session_id", "fold"]], on=["label", "session_id"])
+    return df, csi_cols
 
 
-def clean_tx_matrix(raw_csi: np.ndarray) -> np.ndarray:
-    cleaned = np.zeros_like(raw_csi)
-    for col in range(raw_csi.shape[1]):
-        cleaned[:, col] = hampel_filter_1d(raw_csi[:, col])
-    return cleaned
+def build_windows(df, valid_cols, label_map, window, step, min_pkts):
+    X, y, folds = [], [], []
+    skipped = 0
+    for (label, sid, fold), g in df.groupby(["label", "session_id", "fold"]):
+        per = {}
+        for t in F.TX_IDS:
+            gt = g[g["tx_id"] == t]
+            per[t] = (gt["t"].to_numpy(), gt[valid_cols].to_numpy(np.float32), gt["rssi"].to_numpy(float))
+        s, t_end = g["t"].min(), g["t"].max()
+        while s + window <= t_end + 1e-9:
+            win = {}
+            for t, (ts, amp, rs) in per.items():
+                i0, i1 = np.searchsorted(ts, s, "left"), np.searchsorted(ts, s + window, "left")
+                win[t] = (amp[i0:i1], rs[i0:i1])
+            feats = F.window_features(win, min_pkts)
+            if feats is None:
+                skipped += 1
+            else:
+                X.append(feats)
+                y.append(label_map.get(label, label))
+                folds.append(fold)
+            s += step
+    return np.array(X), np.array(y), np.array(folds), skipped
 
 
-def compute_stats(win: np.ndarray) -> np.ndarray:
-    return np.concatenate([np.mean(win, axis=0), np.std(win, axis=0), np.ptp(win, axis=0)])
-
-
-def build_3tx_dataset(df: pd.DataFrame):
-    csi_cols = [f"csi_{i}" for i in range(128)]
-    X_all, y_all = [], []
-
-    for label, group in df.groupby("label", sort=False):
-        tx_data = {}
-        for tx_id in (1, 2, 3):
-            sub = group[group["tx_id"] == tx_id][csi_cols].to_numpy(dtype=np.float32)
-            tx_data[tx_id] = clean_tx_matrix(sub)
-
-        min_len = min(len(tx_data[1]), len(tx_data[2]), len(tx_data[3]))
-        if min_len < WINDOW_PER_TX:
-            print(f"[CẢNH BÁO] Nhãn '{label}' không đủ dữ liệu cho cả 3 TX (min={min_len}), bỏ qua.")
-            continue
-
-        for start in range(0, min_len - WINDOW_PER_TX + 1, STEP_PER_TX):
-            f1 = compute_stats(tx_data[1][start : start + WINDOW_PER_TX])
-            f2 = compute_stats(tx_data[2][start : start + WINDOW_PER_TX])
-            f3 = compute_stats(tx_data[3][start : start + WINDOW_PER_TX])
-
-            X_all.append(np.concatenate([f1, f2, f3]))
-            y_all.append(label)
-
-    return np.array(X_all), np.array(y_all)
+def new_model():
+    return RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=0, n_jobs=-1)
 
 
 def main():
-    print(f"[1/4] Đang đọc dữ liệu từ '{CSV_FILE}'...")
-    df = pd.read_csv(CSV_FILE)
-    print(f" -> Tổng gói tin: {len(df)} | Phân bố nhãn:\n{df['label'].value_counts()}\n")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", default="csi_dataset_3tx_v2.csv")
+    ap.add_argument("--out", default="csi_model_3tx.pkl")
+    ap.add_argument("--window", type=float, default=F.WINDOW_SEC)
+    ap.add_argument("--step", type=float, default=F.STEP_SEC)
+    ap.add_argument("--min-pkts", type=int, default=F.MIN_PKTS)
+    ap.add_argument("--map", default="", help="gộp nhãn, vd: standing=still,empty=still,walking=motion")
+    args = ap.parse_args()
+    label_map = dict(p.split("=") for p in args.map.split(",") if p)
 
-    print("[2/4] Đang lọc nhiễu Hampel và ghép đặc trưng từ 3 TX...")
-    X, y = build_3tx_dataset(df)
-    print(f" -> Tạo được {len(X)} mẫu tổng hợp (mỗi mẫu {X.shape[1]} đặc trưng).\n")
+    print(f"[1/4] Đọc '{args.csv}'...")
+    df, csi_cols = load(args.csv)
+    sess = df.groupby("label")["session_id"].nunique()
+    print(" Số phiên mỗi nhãn:", {str(k): int(v) for k, v in sess.items()}, "| gói mỗi TX:", df["tx_id"].value_counts().sort_index().to_dict())
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+    valid_idx = F.find_valid_columns(df[csi_cols].to_numpy())
+    valid_cols = [csi_cols[i] for i in valid_idx]
+    print(f" Giữ {len(valid_cols)}/{len(csi_cols)} cột CSI (bỏ {len(csi_cols) - len(valid_cols)} cột hằng/null).")
 
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
+    print("[2/4] Tạo cửa sổ theo thời gian và trích đặc trưng...")
+    X, y, folds, skipped = build_windows(df, valid_cols, label_map, args.window, args.step, args.min_pkts)
+    if len(X) == 0:
+        raise SystemExit("[LỖI] Không tạo được cửa sổ nào: dữ liệu quá ngắn hoặc có TX không gửi gói. "
+                         "Kiểm tra lại từng TX bằng báo cáo cuối mỗi phiên thu.")
+    classes = sorted(map(str, set(y)))
+    print(f" {len(X)} cửa sổ ({X.shape[1]} đặc trưng), bỏ {skipped} cửa sổ thiếu gói. "
+          f"Phân bố: { {c: int((y == c).sum()) for c in classes} }")
 
-    print("[3/4] Đang huấn luyện mô hình SVM (RBF Kernel)...")
-    model = SVC(kernel="rbf", C=10.0, gamma="scale", probability=True, random_state=42)
-    model.fit(X_train_scaled, y_train)
+    print("[3/4] Đánh giá trên phiên chưa thấy...")
+    uniq = sorted(set(folds))
+    if len(uniq) < 2:
+        print(" [CẢNH BÁO] Chỉ có 1 phiên mỗi nhãn, không thể đánh giá trung thực. Hãy thu thêm phiên.")
+    else:
+        all_true, all_pred = [], []
+        for f in uniq:
+            tr, te = folds != f, folds == f
+            if set(y[tr]) != set(classes):
+                print(f" [bỏ qua fold {f}: tập huấn luyện thiếu lớp]")
+                continue
+            m = new_model().fit(X[tr], y[tr])
+            p = m.predict(X[te])
+            all_true += list(y[te]); all_pred += list(p)
+            print(f"  giữ lại phiên số {f + 1} của mỗi nhãn: accuracy {accuracy_score(y[te], p) * 100:.1f}%")
+        print(f"\n=== ACCURACY TRÊN PHIÊN CHƯA THẤY: {accuracy_score(all_true, all_pred) * 100:.1f}% ===")
+        maj = pd.Series(all_true).value_counts(normalize=True).max() * 100
+        print(f"(đoán lớp phổ biến nhất sẽ được {maj:.1f}%)\n")
+        print(classification_report(all_true, all_pred, digits=3))
+        print("Confusion matrix (hàng = thật, cột = đoán), thứ tự:", classes)
+        print(confusion_matrix(all_true, all_pred, labels=classes))
+        if len(uniq) < 4:
+            print(f"\n[Lưu ý] Mới có {len(uniq)} phiên mỗi nhãn nên con số trên chỉ là ước lượng thô.")
 
-    y_pred = model.predict(X_test_scaled)
-    print(f"\n=== ĐỘ CHÍNH XÁC MÔ HÌNH 3 TX: {accuracy_score(y_test, y_pred) * 100:.2f}% ===\n")
-    print(classification_report(y_test, y_pred))
-    print("Ma trận nhầm lẫn (Confusion Matrix):")
-    print(confusion_matrix(y_test, y_pred))
-
-    joblib.dump(
-        {
-            "model": model,
-            "scaler": scaler,
-            "window_per_tx": WINDOW_PER_TX,
-            "classes": list(model.classes_),
-        },
-        MODEL_OUTPUT,
-    )
-    print(f"\n[4/4] Đã lưu mô hình hoàn chỉnh tại '{MODEL_OUTPUT}'.")
+    print("\n[4/4] Huấn luyện mô hình cuối trên toàn bộ dữ liệu và lưu...")
+    model = new_model().fit(X, y)
+    joblib.dump({
+        "model": model, "classes": [str(c) for c in model.classes_], "valid_cols": [int(i) for i in valid_idx],
+        "csi_len": len(csi_cols), "window_sec": args.window, "min_pkts": args.min_pkts,
+        "feature_names": F.feature_names(), "label_map": label_map,
+    }, args.out)
+    print(f" Đã lưu '{args.out}'.")
 
 
 if __name__ == "__main__":

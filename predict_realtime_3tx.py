@@ -1,95 +1,112 @@
+"""Nhận diện hoạt động thời gian thực từ CSI 3 TX, publish kết quả lên MQTT cho dashboard.
+
+  python predict_realtime_3tx.py --model csi_model_3tx.pkl
+Đọc 'esp32/csi_data', publish {"label","confidence","ts"} lên 'ips/har/state'.
+"""
+import argparse
 import json
+import time
 from collections import deque
+
 import joblib
 import numpy as np
-import paho.mqtt.client as mqtt
 
-MQTT_BROKER = "127.0.0.1"
-MQTT_PORT = 1883
-MQTT_TOPIC = "esp32/csi_data"
-MODEL_FILE = "csi_model_3tx.pkl"
+import csi_features as F
 
 
-def hampel_filter_1d(series: np.ndarray, window_size: int = 3, n_sigmas: float = 3.0) -> np.ndarray:
-    filtered = series.copy()
-    k = 1.4826
-    for i in range(window_size, len(series) - window_size):
-        window = series[i - window_size : i + window_size + 1]
-        median = np.median(window)
-        mad = k * np.median(np.abs(window - median))
-        if mad > 0 and np.abs(series[i] - median) > n_sigmas * mad:
-            filtered[i] = median
-    return filtered
+class Predictor:
+    """Không phụ thuộc MQTT, nên có thể kiểm thử bằng cách phát lại dữ liệu."""
 
-
-def extract_tx_feature(buffer_deque: deque) -> np.ndarray:
-    mat = np.array(buffer_deque, dtype=np.float32)
-    for col in range(mat.shape[1]):
-        mat[:, col] = hampel_filter_1d(mat[:, col])
-    return np.concatenate([np.mean(mat, axis=0), np.std(mat, axis=0), np.ptp(mat, axis=0)])
-
-
-class RealtimeCSIPredictor:
-    def __init__(self, model_path: str):
-        artifact = joblib.load(model_path)
+    def __init__(self, artifact, smooth=3):
         self.model = artifact["model"]
-        self.scaler = artifact["scaler"]
-        self.win_size = artifact["window_per_tx"]
-        self.buffers = {
-            1: deque(maxlen=self.win_size),
-            2: deque(maxlen=self.win_size),
-            3: deque(maxlen=self.win_size),
-        }
-        self.packet_counter = 0
+        self.classes = list(artifact["classes"])
+        self.valid_cols = np.array(artifact["valid_cols"])
+        self.csi_len = artifact["csi_len"]
+        self.window = artifact["window_sec"]
+        self.min_pkts = artifact["min_pkts"]
+        self.buf = {t: deque() for t in F.TX_IDS}
+        self.history = deque(maxlen=smooth)
 
-    def on_connect(self, client, userdata, flags, reason_code, properties=None):
-        if reason_code == 0:
-            print(f"[OK] Sẵn sàng nhận diện thời gian thực từ '{MQTT_TOPIC}'...\n")
-            client.subscribe(MQTT_TOPIC)
+    def ingest(self, tx_id, csi, rssi, now):
+        if tx_id not in self.buf or len(csi) != self.csi_len:
+            return False
+        self.buf[tx_id].append((now, np.asarray(csi, dtype=np.float32)[self.valid_cols], float(rssi)))
+        for d in self.buf.values():                      # bỏ gói cũ hơn cửa sổ, kể cả TX đã im
+            while d and d[0][0] < now - self.window:
+                d.popleft()
+        return True
 
-    def on_message(self, client, userdata, msg):
-        try:
-            payload = json.loads(msg.payload.decode("utf-8"))
-            tx_id = int(payload.get("tx_id", 0))
-            csi = payload.get("csi", [])
+    def counts(self):
+        return {t: len(d) for t, d in self.buf.items()}
 
-            if tx_id not in (1, 2, 3) or len(csi) != 128:
-                return
-
-            self.buffers[tx_id].append(csi)
-            self.packet_counter += 1
-
-            # Dự đoán mỗi 15 gói khi cả 3 hàng đợi đã đầy
-            if self.packet_counter % 15 == 0 and all(
-                len(self.buffers[i]) == self.win_size for i in (1, 2, 3)
-            ):
-                f1 = extract_tx_feature(self.buffers[1])
-                f2 = extract_tx_feature(self.buffers[2])
-                f3 = extract_tx_feature(self.buffers[3])
-
-                X_live = np.concatenate([f1, f2, f3]).reshape(1, -1)
-                X_scaled = self.scaler.transform(X_live)
-
-                pred_label = self.model.predict(X_scaled)[0]
-                probs = self.model.predict_proba(X_scaled)[0]
-                confidence = np.max(probs) * 100
-
-                print(f"[DỰ ĐOÁN] Hành động: {pred_label.upper():<12} | Độ tin cậy: {confidence:.1f}%")
-
-        except Exception:
-            pass
+    def predict(self):
+        per = {}
+        for t, d in self.buf.items():
+            if len(d) < self.min_pkts:
+                return None
+            per[t] = (np.stack([x[1] for x in d]), np.array([x[2] for x in d]))
+        feats = F.window_features(per, self.min_pkts)
+        if feats is None:
+            return None
+        self.history.append(self.model.predict_proba(feats.reshape(1, -1))[0])
+        avg = np.mean(self.history, axis=0)               # làm mượt qua vài lần dự đoán gần nhất
+        i = int(np.argmax(avg))
+        return self.classes[i], float(avg[i])
 
 
 def main():
-    predictor = RealtimeCSIPredictor(MODEL_FILE)
+    import paho.mqtt.client as mqtt
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--broker", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=1883)
+    ap.add_argument("--model", default="csi_model_3tx.pkl")
+    ap.add_argument("--topic-in", default="esp32/csi_data")
+    ap.add_argument("--topic-out", default="ips/har/state")
+    ap.add_argument("--interval", type=float, default=0.5, help="chu kỳ dự đoán (giây)")
+    ap.add_argument("--smooth", type=int, default=3)
+    args = ap.parse_args()
+
+    pred = Predictor(joblib.load(args.model), smooth=args.smooth)
+    state = {"last": 0.0, "last_status": 0.0, "bad": 0}
+
     try:
         client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     except AttributeError:
         client = mqtt.Client()
 
-    client.on_connect = predictor.on_connect
-    client.on_message = predictor.on_message
-    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+    def on_connect(c, userdata, flags, reason_code, properties=None):
+        if reason_code == 0:
+            print(f"[OK] Đang nhận '{args.topic_in}', publish lên '{args.topic_out}'. Lớp: {pred.classes}")
+            c.subscribe(args.topic_in)
+        else:
+            print(f"[LỖI] MQTT: {reason_code}")
+
+    def on_message(c, userdata, msg):
+        now = time.time()
+        try:
+            p = json.loads(msg.payload.decode("utf-8"))
+            ok = pred.ingest(int(p.get("tx_id", 0)), p.get("csi", []), p.get("rssi", 0), now)
+        except (ValueError, TypeError, UnicodeDecodeError):
+            ok = False
+        if not ok:
+            state["bad"] += 1
+            return
+        if now - state["last"] < args.interval:
+            return
+        state["last"] = now
+        res = pred.predict()
+        if res is None:
+            if now - state["last_status"] > 2:
+                state["last_status"] = now
+                print(f"[chờ đủ gói] số gói trong cửa sổ: {pred.counts()} (cần >= {pred.min_pkts} mỗi TX)")
+            return
+        label, conf = res
+        c.publish(args.topic_out, json.dumps({"label": label, "confidence": round(conf, 3), "ts": int(now * 1000)}))
+        print(f"[DỰ ĐOÁN] {label.upper():<10} | tin cậy {conf * 100:5.1f}% | gói/TX {list(pred.counts().values())}")
+
+    client.on_connect, client.on_message = on_connect, on_message
+    client.connect(args.broker, args.port, keepalive=60)
     client.loop_forever()
 
 
