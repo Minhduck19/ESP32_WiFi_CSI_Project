@@ -1,0 +1,2 @@
+source D:/Users/UIT/ESP32_WiFi_CSI_Project/esp-csi/examples/get-started/csi_recv/build/bootloader/gdbinit/symbols
+source D:/Users/UIT/ESP32_WiFi_CSI_Project/esp-csi/examples/get-started/csi_recv/build/bootloader/gdbinit/connect

@@ -1,0 +1,6 @@
+-Wno-frame-address
+-mlongcalls
+-fno-builtin-memcpy
+-fno-builtin-memset
+-fno-builtin-bzero
+"-specs=D:/Users/UIT/ESP32_WiFi_CSI_Project/esp-csi/examples/get-started/csi_send/build/specs/picolibc.specs"
